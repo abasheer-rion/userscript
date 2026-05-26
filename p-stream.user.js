@@ -1,17 +1,17 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.0.3
-// @description  Userscript replacement for the P-Stream extension
-// @author       Duplicake, P-Stream Team
+// @version      1.0.4
+// @description  Userscript replacement for the P-Stream extension (abasheer-rion fork — permissive media interception)
+// @author       Duplicake, P-Stream Team, abasheer-rion
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/p-stream/Userscript/main/p-stream.user.js
-// @downloadURL  https://raw.githubusercontent.com/p-stream/Userscript/main/p-stream.user.js
+// @updateURL    https://raw.githubusercontent.com/abasheer-rion/userscript/main/p-stream.user.js
+// @downloadURL  https://raw.githubusercontent.com/abasheer-rion/userscript/main/p-stream.user.js
 // ==/UserScript==
 
 (function () {
@@ -50,6 +50,68 @@
   const PROXY_CACHE = new Map();
   // Blacklist of sources that fail to play with userscript but work with extension
   const SOURCE_BLACKLIST = new Set(['fsharetv.co', 'lmscript.xyz']);
+
+  // Cross-origin hosts that should NEVER be intercepted even in permissive mode
+  // (analytics, telemetry, common app infra — these would slow the page if forced through gmRequest).
+  const PERMISSIVE_HOST_DENYLIST = [
+    'google-analytics.com', 'googletagmanager.com', 'doubleclick.net',
+    'sentry.io', 'ingest.sentry.io', 'cloudflareinsights.com',
+    'plausible.io', 'posthog.com', 'mixpanel.com', 'segment.io',
+    'gstatic.com', 'googleapis.com', 'fonts.googleapis.com',
+    'tmdb.org', 'themoviedb.org', 'image.tmdb.org',
+    'clerk.dev', 'clerk.com', 'clerk.accounts.dev',
+    'pstream.mov', 'p-stream.org', 'pages.dev',
+    'cloudflare.com', 'cf-ipv6.com',
+  ];
+
+  // URL patterns that look like streamable media (HLS, DASH, MP4, segments, keys, subs).
+  // Used by permissive matcher to decide whether to proxy an unrecognized cross-origin URL.
+  const MEDIA_URL_PATTERNS = [
+    /\.m3u8(\?|$|#|\/)/i,
+    /\.m3u(\?|$|#|\/)/i,
+    /\.mpd(\?|$|#|\/)/i,
+    /\.ts(\?|$|#)/i,
+    /\.tsv(\?|$|#)/i,
+    /\.m4s(\?|$|#)/i,
+    /\.m4a(\?|$|#)/i,
+    /\.m4v(\?|$|#)/i,
+    /\.mp4(\?|$|#)/i,
+    /\.mkv(\?|$|#)/i,
+    /\.webm(\?|$|#)/i,
+    /\.aac(\?|$|#)/i,
+    /\.flac(\?|$|#)/i,
+    /\.opus(\?|$|#)/i,
+    /\.vtt(\?|$|#)/i,
+    /\.srt(\?|$|#)/i,
+    /\.ass(\?|$|#)/i,
+    /\.ssa(\?|$|#)/i,
+    /\.key(\?|$|#)/i,
+    /\/seg[-_/]/i,
+    /\/segment/i,
+    /\/chunk/i,
+    /\/frag/i,
+    /\/enproxy\//i,
+    /\/proxy\//i,
+    /\/hls\//i,
+    /\/dash\//i,
+    /\/manifest\b/i,
+    /\/playlist\b/i,
+    /seg\.html(\?|$|#)/i,
+  ];
+
+  // Accumulated allowlist of hosts ever registered via prepareStream — provides "sticky" coverage
+  // so later requests to a host that was once whitelisted keep working even after rule churn.
+  const SEEN_STREAM_HOSTS = new Set();
+
+  // Permissive mode toggle — defaults ON. Can be flipped via window.__pstreamConfig.permissive = false.
+  const getPermissiveEnabled = () => {
+    try {
+      const cfg = pageWindow.__pstreamConfig;
+      if (cfg && cfg.permissive === false) return false;
+    } catch {}
+    return true;
+  };
+
   let fetchPatched = false;
   let xhrPatched = false;
   let mediaPatched = false;
@@ -188,6 +250,9 @@
     return canAccessCookies();
   };
 
+  const hostMatchesAny = (host, list) =>
+    list.some((d) => host === d || host.endsWith(`.${d}`));
+
   const findRuleForUrl = (url) => {
     const normalized = normalizeUrl(url);
     if (!normalized) return null;
@@ -199,7 +264,10 @@
       return null;
     }
 
+    // 1) Exact-match path (original behavior) — explicit rule for this host/regex.
+    let lastRule = null;
     for (const rule of STREAM_RULES.values()) {
+      lastRule = rule;
       if (rule.targetDomains?.some((d) => host === d || host.endsWith(`.${d}`))) return rule;
       if (rule.targetRegex) {
         try {
@@ -210,7 +278,20 @@
         }
       }
     }
-    return null;
+
+    // 2) Permissive fallback — for cross-origin media-shaped URLs while a stream is active.
+    //    Fixes the LEVEL_LOADED race and cross-CDN segment hosts that providers can't pre-declare.
+    if (!getPermissiveEnabled()) return null;
+    if (STREAM_RULES.size === 0) return null;
+    if (isSameOrigin(normalized)) return null;
+    if (hostMatchesAny(host, PERMISSIVE_HOST_DENYLIST)) return null;
+
+    const isMediaShaped = MEDIA_URL_PATTERNS.some((rx) => rx.test(normalized));
+    const isSeenHost = SEEN_STREAM_HOSTS.has(host);
+    if (!isMediaShaped && !isSeenHost) return null;
+
+    log('Permissive match:', host, '(', isMediaShaped ? 'media-shaped' : 'sticky-host', ')');
+    return lastRule;
   };
 
   // --- Media helpers -----------------------------------------------------
@@ -1021,8 +1102,13 @@
       ...reqBody,
       responseHeaders,
     });
-    
-    log('Stream prepared:', reqBody.ruleId);
+
+    // Accumulate seen hosts for the sticky permissive matcher.
+    (reqBody.targetDomains || []).forEach((d) => {
+      if (typeof d === 'string' && d) SEEN_STREAM_HOSTS.add(d);
+    });
+
+    log('Stream prepared:', reqBody.ruleId, 'domains:', reqBody.targetDomains);
     ensureAllProxies();
     
     // Schedule cleanup after a short delay to catch any old blobs
@@ -1090,6 +1176,21 @@
   relay({ name: 'hello' }, handleHello);
   relay({ name: 'makeRequest' }, handleMakeRequest);
   relay({ name: 'prepareStream' }, handlePrepareStream);
+
+  // Expose a debug handle so the host page (and devtools) can inspect state.
+  try {
+    pageWindow.__pstreamDebug = {
+      scriptVersion: SCRIPT_VERSION,
+      manifestVersion: '1.0.4',
+      get rules() { return Array.from(STREAM_RULES.entries()); },
+      get seenHosts() { return Array.from(SEEN_STREAM_HOSTS); },
+      get blobs() { return MEDIA_BLOBS.size; },
+      get permissive() { return getPermissiveEnabled(); },
+      mediaPatterns: MEDIA_URL_PATTERNS.map((r) => r.source),
+      denylist: PERMISSIVE_HOST_DENYLIST.slice(),
+      clearCache: () => { PROXY_CACHE.clear(); return 'ok'; },
+    };
+  } catch {}
   relay({ name: 'openPage' }, handleOpenPage);
 
   log('Userscript proxy loaded');
